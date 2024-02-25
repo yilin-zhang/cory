@@ -1,7 +1,8 @@
-use anyhow::{anyhow, Result};
 use cpal::{FromSample, SizedSample};
+use eyre::{eyre, Result};
 use hound::{SampleFormat, WavReader};
 use std::io::{self, BufReader};
+use std::sync::atomic::AtomicBool;
 use std::sync::{atomic::Ordering, mpsc::Sender, Arc};
 
 use crate::utils::AtomicF64;
@@ -11,13 +12,8 @@ const AUDIO_FILE: &[u8] = include_bytes!("../assets/click.wav");
 #[derive(Debug)]
 pub struct SamplerParam {
     pub bpm: AtomicF64,
-}
-
-#[derive(Debug)]
-pub enum SamplerStatus {
-    Play,
-    Pause,
-    Stop,
+    pub playing: AtomicBool,
+    pub volume: AtomicF64,
 }
 
 #[derive(Debug)]
@@ -27,13 +23,18 @@ pub enum SamplerEvent {
 
 #[derive(Debug)]
 pub struct Sampler {
+    // buffer
     samples: Vec<f64>,
+    #[allow(dead_code)]
     n_channels: u16,
     sample_rate: u32,
-    playhead: f64,
+    // parameter
     param: Arc<SamplerParam>,
-    status: SamplerStatus,
+    // event sender (optional)
     sender: Option<Sender<SamplerEvent>>,
+    // internal states
+    playhead: f64,
+    was_playing: bool,
 }
 
 impl Sampler {
@@ -43,6 +44,7 @@ impl Sampler {
         Self::from_reader(&mut reader, param, sender)
     }
 
+    #[allow(dead_code)]
     pub fn from_path(
         file_path: &str,
         param: Arc<SamplerParam>,
@@ -72,8 +74,8 @@ impl Sampler {
                     sample_rate: spec.sample_rate,
                     playhead: 0.0,
                     param,
-                    status: SamplerStatus::Stop,
                     sender,
+                    was_playing: false,
                 })
             }
             SampleFormat::Int => {
@@ -90,7 +92,7 @@ impl Sampler {
                         buffer_i32_to_f64(&buffer_in, bit_depth, &mut buffer_out)?;
                         Ok(buffer_out)
                     }
-                    _ => Err(anyhow!("Unsupported integer sample format bit depth")),
+                    _ => Err(eyre!("Unsupported integer sample format bit depth")),
                 }?;
 
                 Ok(Self {
@@ -99,8 +101,8 @@ impl Sampler {
                     sample_rate: spec.sample_rate,
                     playhead: 0.0,
                     param,
-                    status: SamplerStatus::Stop,
                     sender,
+                    was_playing: false,
                 })
             }
         }
@@ -123,10 +125,25 @@ impl Sampler {
         T: SizedSample + FromSample<f64>,
     {
         for frame in data.chunks_mut(n_channels as usize) {
+            // update playing state
+            let playing = self.param.playing.load(Ordering::Relaxed);
+            if !self.was_playing && playing {
+                self.was_playing = true;
+            } else if self.was_playing && !playing {
+                self.was_playing = false;
+                self.playhead = 0.0;
+            }
+
+            // skip if is not playing
+            if !playing {
+                continue;
+            }
+
             // BUG: This does not handle stereo samples.
+            let volume = self.param.volume.load(Ordering::Relaxed);
             let idx = self.playhead.round() as usize;
             if idx < self.samples.len() {
-                let value: T = T::from_sample(self.samples[idx]);
+                let value: T = T::from_sample(self.samples[idx] * volume);
                 for sample in frame.iter_mut() {
                     *sample = value;
                 }
@@ -141,6 +158,7 @@ impl Sampler {
                 self.playhead = playhead_inc;
             } else {
                 self.playhead = playhead_inc - length;
+                // send a tick whenever the playhead rewinds
                 self.send_tick().unwrap();
             }
         }
@@ -159,7 +177,7 @@ fn buffer_i32_to_f64(buffer_in: &[i32], bit_depth: u16, buffer_out: &mut [f64]) 
     let max_value = match bit_depth {
         24 => Ok(((1 << 23) - 1) as f64),
         32 => Ok(i32::MAX as f64),
-        _ => Err(anyhow!("Not supported bit depth")),
+        _ => Err(eyre!("Not supported bit depth")),
     }?;
     for (sample_in, sample_out) in buffer_in.iter().zip(buffer_out.iter_mut()) {
         let normalized_sample = *sample_in as f64 / max_value;
@@ -171,7 +189,7 @@ fn buffer_i32_to_f64(buffer_in: &[i32], bit_depth: u16, buffer_out: &mut [f64]) 
 fn buffer_i16_to_f64(buffer_in: &[i16], bit_depth: u16, buffer_out: &mut [f64]) -> Result<()> {
     let max_value = match bit_depth {
         16 => Ok(i16::MAX as f64),
-        _ => Err(anyhow!("Not supported bit depth")),
+        _ => Err(eyre!("Not supported bit depth")),
     }?;
     for (sample_in, sample_out) in buffer_in.iter().zip(buffer_out.iter_mut()) {
         let normalized_sample = *sample_in as f64 / max_value;

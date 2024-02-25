@@ -1,52 +1,77 @@
-use anyhow::Result;
-use cpal::traits::{DeviceTrait, HostTrait};
-use sampler::{Sampler, SamplerParam};
-use std::sync::mpsc::channel;
-use std::sync::Arc;
-use std::thread;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    mpsc::channel,
+    Arc,
+};
 
-use crate::playback::run_metronome;
+use cpal::traits::{HostTrait, StreamTrait};
+use eyre::Result;
+use ratatui::{backend::CrosstermBackend, Terminal};
+
+use crate::config::CoryConfig;
+use crate::playback::init_stream;
+use crate::sampler::{Sampler, SamplerParam};
+use crate::tui::{App, Tui, UIEventCapturer};
 use crate::utils::AtomicF64;
 
+mod config;
 mod playback;
 mod sampler;
+mod tui;
 mod utils;
 
 fn main() -> Result<()> {
-    let (sender, receiver) = channel();
-    let param = Arc::new(SamplerParam { bpm: AtomicF64::new(120.0) });
-    let sampler = Sampler::new(param.clone(), Some(sender.clone()))?;
+    // Load config
+    let mut config = CoryConfig::load()?;
 
+    // Initialize channel
+    let (sampler_event_sender, sampler_event_receiver) = channel();
+
+    // Initialize sampler
+    let param = Arc::new(SamplerParam {
+        bpm: AtomicF64::new(config.bpm),
+        playing: AtomicBool::new(true),
+        volume: AtomicF64::new(config.volume),
+    });
+    let sampler = Sampler::new(param.clone(), Some(sampler_event_sender.clone()))?;
+
+    // Initialize audio device
     let host = cpal::default_host();
     let device = host.default_output_device().unwrap();
-    let config = device.default_output_config()?;
+    let stream = init_stream(&device, sampler);
 
-    let handle = thread::spawn(move || {
-        loop {
-            let x = receiver.recv().unwrap();
-            println!("TICK!");
+    // Initialize TUI
+    let backend = CrosstermBackend::new(std::io::stderr());
+    let terminal = Terminal::new(backend)?;
+    let ui_event_capturer = UIEventCapturer::new(20);
+    let mut tui = Tui::new(terminal, ui_event_capturer);
+    let mut app = App::new(param.clone());
+
+    tui.enter()?;
+    stream.play()?;
+    while !app.should_quit {
+        // Render the user interface.
+        tui.draw(&mut app)?;
+
+        // Audio event (try not to block)
+        match sampler_event_receiver.try_recv() {
+            Ok(ref e) => app.update_by_sampler_event(e),
+            _ => (),
         }
-    });
 
-    match config.sample_format() {
-        cpal::SampleFormat::I8 => run_metronome::<i8>(&device, &config.into(), sampler),
-        cpal::SampleFormat::I16 => run_metronome::<i16>(&device, &config.into(), sampler),
-        // cpal::SampleFormat::I24 => run::<I24>(&device, &config.into()),
-        cpal::SampleFormat::I32 => run_metronome::<i32>(&device, &config.into(), sampler),
-        // cpal::SampleFormat::I48 => run::<I48>(&device, &config.into()),
-        cpal::SampleFormat::I64 => run_metronome::<i64>(&device, &config.into(), sampler),
-        cpal::SampleFormat::U8 => run_metronome::<u8>(&device, &config.into(), sampler),
-        cpal::SampleFormat::U16 => run_metronome::<u16>(&device, &config.into(), sampler),
-        // cpal::SampleFormat::U24 => run::<U24>(&device, &config.into()),
-        cpal::SampleFormat::U32 => run_metronome::<u32>(&device, &config.into(), sampler),
-        // cpal::SampleFormat::U48 => run::<U48>(&device, &config.into()),
-        cpal::SampleFormat::U64 => run_metronome::<u64>(&device, &config.into(), sampler),
-        cpal::SampleFormat::F32 => run_metronome::<f32>(&device, &config.into(), sampler),
-        cpal::SampleFormat::F64 => run_metronome::<f64>(&device, &config.into(), sampler),
-        sample_format => panic!("Unsupported sample format '{sample_format}'"),
+        // UI event
+        let input_event = tui.ui_event_capturer.next()?;
+        if let Some(ui_event) = app.map_input_event(&input_event) {
+            app.update_by_ui_event(&ui_event);
+        }
     }
+    stream.pause()?;
+    tui.exit()?;
 
-    handle.join();
+    // update config and write
+    config.bpm = param.bpm.load(Ordering::Relaxed);
+    config.volume = param.volume.load(Ordering::Relaxed);
+    config.write()?;
 
     Ok(())
 }
